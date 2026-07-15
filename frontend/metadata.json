@@ -1,0 +1,6 @@
+{
+  "name": "YouTube Playlist Downloader",
+  "description": "A elegant full-stack interface to download entire playlists or specific videos, select quality presets, customize concurrent jobs, and run/export your yt-dlp automation script.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,19 @@
+# Backend (Python)
+backend/__pycache__/
+backend/**/__pycache__/
+*.pyc
+backend/downloads/
+backend/watch_data/
+
+# Frontend (Node)
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/coverage/
+
+# Common
+.DS_Store
+*.log
+.env*
+!.env.example
+.vscode/
