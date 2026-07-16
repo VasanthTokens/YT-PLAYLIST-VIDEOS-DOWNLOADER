@@ -16,6 +16,7 @@ import re
 import time
 import threading
 import uuid
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
  
 from flask import Flask, request, jsonify
@@ -518,8 +519,27 @@ def export_script():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
- 
- 
+
+
+@app.route("/api/debug/rclone", methods=["GET"])
+def debug_rclone():
+    try:
+        version = subprocess.run(
+            ["rclone", "version"], capture_output=True, text=True, timeout=10
+        )
+        drive_list = subprocess.run(
+            ["rclone", "lsd", "gdrive:"], capture_output=True, text=True, timeout=15
+        )
+        return jsonify({
+            "rclone_version_stdout": version.stdout,
+            "rclone_version_stderr": version.stderr,
+            "drive_list_stdout": drive_list.stdout,
+            "drive_list_stderr": drive_list.stderr,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 import sys
 watch_manager._init(sys.modules[__name__])
  
