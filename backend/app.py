@@ -538,23 +538,7 @@ def health():
     return jsonify({"status": "ok"})
 
 
-@app.route("/api/debug/rclone", methods=["GET"])
-def debug_rclone():
-    try:
-        version = subprocess.run(
-            ["./rclone", "version"], capture_output=True, text=True, timeout=10
-        )
-        drive_list = subprocess.run(
-            ["./rclone", "lsd", "gdrive:"], capture_output=True, text=True, timeout=15
-        )
-        return jsonify({
-            "rclone_version_stdout": version.stdout,
-            "rclone_version_stderr": version.stderr,
-            "drive_list_stdout": drive_list.stdout,
-            "drive_list_stderr": drive_list.stderr,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+
 
 
 import sys
