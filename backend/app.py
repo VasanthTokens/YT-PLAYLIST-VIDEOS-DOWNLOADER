@@ -23,6 +23,23 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
  
+import shutil
+
+def setup_writable_rclone_config():
+    """
+    Render's Secret Files are read-only. rclone needs to rewrite its
+    config file periodically (to save refreshed Google Drive tokens),
+    so we copy the secret file into a writable location at startup
+    and point rclone there instead.
+    """
+    source = "/etc/secrets/rclone.conf"
+    writable_path = "/tmp/rclone.conf"
+
+    if os.path.exists(source):
+        shutil.copy(source, writable_path)
+        os.environ["RCLONE_CONFIG"] = writable_path
+
+setup_writable_rclone_config()
 app = Flask(__name__)
 CORS(app)  # harmless if frontend is proxied same-origin; needed if you split hosts
  
