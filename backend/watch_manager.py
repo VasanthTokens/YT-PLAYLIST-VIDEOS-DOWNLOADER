@@ -157,7 +157,7 @@ def _sync_to_drive(local_folder, dest_subfolder):
     dest = f"{RCLONE_REMOTE}/{dest_subfolder}"
     try:
         result = subprocess.run(
-            ["rclone", "move", local_folder, dest, "--delete-empty-src-dirs"],
+            ["./rclone", "move", local_folder, dest, "--delete-empty-src-dirs"],
             capture_output=True,
             text=True,
             timeout=600,
