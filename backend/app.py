@@ -525,10 +525,10 @@ def health():
 def debug_rclone():
     try:
         version = subprocess.run(
-            ["rclone", "version"], capture_output=True, text=True, timeout=10
+            ["./rclone", "version"], capture_output=True, text=True, timeout=10
         )
         drive_list = subprocess.run(
-            ["rclone", "lsd", "gdrive:"], capture_output=True, text=True, timeout=15
+            ["./rclone", "lsd", "gdrive:"], capture_output=True, text=True, timeout=15
         )
         return jsonify({
             "rclone_version_stdout": version.stdout,
