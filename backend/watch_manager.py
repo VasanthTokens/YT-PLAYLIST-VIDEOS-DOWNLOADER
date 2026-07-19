@@ -101,7 +101,7 @@ def watch_add():
  
     if not url:
         return jsonify({"error": "Channel or playlist URL is required."}), 400
- 
+    _ensure_data_dir()  
     watch_id = uuid.uuid4().hex[:9]
     archive_path = os.path.join(DATA_DIR, f"archive_{watch_id}.txt")
     open(archive_path, "a").close()  # create empty archive file
