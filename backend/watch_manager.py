@@ -28,6 +28,12 @@ DATA_DIR = os.path.join(os.getcwd(), "watch_data")
 WATCH_FILE = os.path.join(DATA_DIR, "watched_channels.json")
 watch_lock = threading.Lock()
  
+# Path to YouTube cookies (exported from a dedicated Google account) so
+# yt-dlp's requests look like a real logged-in browser session instead
+# of anonymous cloud-server traffic, which YouTube's bot-detection often
+# blocks with a "Sign in to confirm you're not a bot" error.
+COOKIE_FILE = "/etc/secrets/cookies.txt"
+ 
  
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -69,6 +75,9 @@ def _seed_archive(url, archive_path):
         "skip_download": True,
         "playlist_items": f"1-{SEED_COUNT}",
     }
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts["cookiefile"] = COOKIE_FILE
+ 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
  
@@ -207,6 +216,8 @@ def _check_one(entry):
         "socket_timeout": 30,
         "progress_hooks": [hook],
     }
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts["cookiefile"] = COOKIE_FILE
  
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([entry["url"]])

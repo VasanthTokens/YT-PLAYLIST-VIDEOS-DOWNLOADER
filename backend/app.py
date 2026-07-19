@@ -24,7 +24,7 @@ from flask_cors import CORS
 import yt_dlp
  
 import shutil
-
+ 
 def setup_writable_rclone_config():
     """
     Render's Secret Files are read-only. rclone needs to rewrite its
@@ -34,12 +34,19 @@ def setup_writable_rclone_config():
     """
     source = "/etc/secrets/rclone.conf"
     writable_path = "/tmp/rclone.conf"
-
+ 
     if os.path.exists(source):
         shutil.copy(source, writable_path)
         os.environ["RCLONE_CONFIG"] = writable_path
-
+ 
 setup_writable_rclone_config()
+ 
+# Path to YouTube cookies (exported from a dedicated Google account) so
+# yt-dlp's requests look like a real logged-in browser session instead
+# of anonymous cloud-server traffic, which YouTube's bot-detection often
+# blocks with a "Sign in to confirm you're not a bot" error.
+COOKIE_FILE = "/etc/secrets/cookies.txt"
+ 
 app = Flask(__name__)
 CORS(app)  # harmless if frontend is proxied same-origin; needed if you split hosts
  
@@ -82,7 +89,14 @@ def format_size(num_bytes):
  
 def fetch_playlist_entries(url):
     """Real metadata fetch (no AI hallucination, no mock data)."""
-    ydl_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
+    ydl_opts = {
+        "quiet": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts["cookiefile"] = COOKIE_FILE
+ 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
  
@@ -194,6 +208,8 @@ def download_one(session, task, folder, fmt_string):
         "noprogress": True,
         "progress_hooks": [make_progress_hook(session, task)],
     }
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts["cookiefile"] = COOKIE_FILE
  
     with sessions_lock:
         task["status"] = "downloading"
@@ -536,11 +552,8 @@ def export_script():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
-
-
-
-
-
+ 
+ 
 import sys
 watch_manager._init(sys.modules[__name__])
  
