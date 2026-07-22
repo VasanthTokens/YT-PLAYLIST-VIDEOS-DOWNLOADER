@@ -1,12 +1,19 @@
 """
-YouTube Playlist Downloader - Real backend (Flask + yt-dlp)
+YouTube Playlist Downloader - LOCAL VERSION (Flask + yt-dlp)
  
-This replaces the simulated Node/Express/Gemini server that AI Studio generated.
-Every endpoint here does REAL work:
+Runs entirely on your own PC, using your own home internet connection.
+No cloud hosting, no Google Drive syncing -- videos are saved straight to
+DOWNLOAD_ROOT on your own disk, which is permanent storage.
+ 
+Endpoints:
   - /api/playlist-info fetches REAL playlist/video metadata via yt-dlp
   - /api/download/start kicks off REAL downloads (ThreadPoolExecutor + yt-dlp)
   - /api/download/status/<id> reports REAL progress read from yt-dlp's own hooks
   - /api/export-script hands back a standalone .py script with the same logic
+  - /api/watch/* (see watch_manager.py) manages "watch a channel for future
+    uploads" -- a check runs automatically once when this app starts up,
+    so simply opening the app is what triggers new-video downloads, instead
+    of needing a 24/7 background scheduler.
  
 API shapes match src/types.ts in the React frontend exactly, so the UI
 needs zero changes.
@@ -16,36 +23,11 @@ import re
 import time
 import threading
 import uuid
-import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
  
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
- 
-import shutil
- 
-def setup_writable_rclone_config():
-    """
-    Render's Secret Files are read-only. rclone needs to rewrite its
-    config file periodically (to save refreshed Google Drive tokens),
-    so we copy the secret file into a writable location at startup
-    and point rclone there instead.
-    """
-    source = "/etc/secrets/rclone.conf"
-    writable_path = "/tmp/rclone.conf"
- 
-    if os.path.exists(source):
-        shutil.copy(source, writable_path)
-        os.environ["RCLONE_CONFIG"] = writable_path
- 
-setup_writable_rclone_config()
- 
-# Path to YouTube cookies (exported from a dedicated Google account) so
-# yt-dlp's requests look like a real logged-in browser session instead
-# of anonymous cloud-server traffic, which YouTube's bot-detection often
-# blocks with a "Sign in to confirm you're not a bot" error.
-COOKIE_FILE = "/etc/secrets/cookies.txt"
  
 app = Flask(__name__)
 CORS(app)  # harmless if frontend is proxied same-origin; needed if you split hosts
@@ -89,14 +71,7 @@ def format_size(num_bytes):
  
 def fetch_playlist_entries(url):
     """Real metadata fetch (no AI hallucination, no mock data)."""
-    ydl_opts = {
-        "quiet": True,
-        "extract_flat": True,
-        "skip_download": True,
-    }
-    if os.path.exists(COOKIE_FILE):
-        ydl_opts["cookiefile"] = COOKIE_FILE
- 
+    ydl_opts = {"quiet": True, "extract_flat": True, "skip_download": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
  
@@ -208,8 +183,6 @@ def download_one(session, task, folder, fmt_string):
         "noprogress": True,
         "progress_hooks": [make_progress_hook(session, task)],
     }
-    if os.path.exists(COOKIE_FILE):
-        ydl_opts["cookiefile"] = COOKIE_FILE
  
     with sessions_lock:
         task["status"] = "downloading"
@@ -333,7 +306,7 @@ def download_start():
         "elapsedSeconds": 0,
         "logs": [
             "=" * 50,
-            "YOUTUBE PLAYLIST DOWNLOADER (LIVE BACKEND)",
+            "YOUTUBE PLAYLIST DOWNLOADER (LOCAL)",
             "=" * 50,
             f"Folder        : {folder}",
             f"Parallel jobs : {max_workers}",
@@ -557,8 +530,26 @@ def health():
 import sys
 watch_manager._init(sys.modules[__name__])
  
+ 
+def _run_startup_watch_check():
+    """Runs one watch-check pass automatically when the app starts up.
+    This is what replaces the old 6-hour cron scheduler: instead of a
+    background timer running 24/7, simply starting/opening the app is
+    what triggers a check for new videos on all watched channels."""
+    def _worker():
+        time.sleep(2)  # brief delay so the server is fully ready first
+        with app.test_request_context():
+            try:
+                watch_manager.watch_tick()
+                print("[startup] Watch check completed.")
+            except Exception as e:
+                print(f"[startup] Watch check failed: {e}")
+ 
+    threading.Thread(target=_worker, daemon=True).start()
+ 
+ 
 if __name__ == "__main__":
     os.makedirs(DOWNLOAD_ROOT, exist_ok=True)
+    _run_startup_watch_check()
     port = int(os.environ.get("PORT", 5000))
-    debug_mode = os.environ.get("FLASK_DEBUG", "true").lower() == "true"
-    app.run(host="0.0.0.0", port=port, debug=debug_mode)
+    app.run(host="0.0.0.0", port=port, debug=True)

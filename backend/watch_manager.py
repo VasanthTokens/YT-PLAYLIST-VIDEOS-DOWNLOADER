@@ -1,17 +1,29 @@
 """
-Channel-watching module for YT-PLAYLIST-VIDEOS-DOWNLOADER.
+Channel-watching module for YT-PLAYLIST-VIDEOS-DOWNLOADER (LOCAL VERSION).
  
 Adds:
   POST   /api/watch/add          -> start watching a channel/playlist URL
   GET    /api/watch/list         -> list all watched entries + status
   DELETE /api/watch/<watch_id>   -> stop watching
-  POST   /api/watch/tick         -> run one check-and-download pass (for cron / external pinger)
+  POST   /api/watch/tick         -> run one check-and-download pass
  
-Reuses app.py's QUALITY_MAP, sanitize_filename, and DOWNLOAD_ROOT so behavior
-(quality choice, folder naming) stays identical to manual downloads.
+This is the simplified, local-only version of the watcher:
+  - No Google Drive / rclone syncing -- videos are downloaded straight to
+    your own PC's disk (DOWNLOAD_ROOT), which is permanent storage, unlike
+    a cloud host's temporary disk.
+  - No external cron scheduler needed -- app.py calls /api/watch/tick once
+    automatically when the app starts up (see the bottom of app.py), so
+    "opening the app" is what triggers a check, instead of a 6-hour timer.
+  - Still runs from your own home internet connection, which YouTube treats
+    as normal residential traffic rather than data-center/bot traffic.
  
 Each watched entry gets its own yt-dlp `download_archive` file, so re-running
 a check only ever downloads videos it hasn't seen before -- no manual diffing.
+ 
+BLOCKED VIDEO RETRY:
+Occasionally a video may still fail to download. Rather than losing track
+of it, it's recorded in entry["blockedVideos"] with its direct link, and
+automatically retried every time you open the app -- no manual work needed.
 """
 import os
 import json
@@ -27,12 +39,6 @@ watch_bp = Blueprint("watch_bp", __name__)
 DATA_DIR = os.path.join(os.getcwd(), "watch_data")
 WATCH_FILE = os.path.join(DATA_DIR, "watched_channels.json")
 watch_lock = threading.Lock()
- 
-# Path to YouTube cookies (exported from a dedicated Google account) so
-# yt-dlp's requests look like a real logged-in browser session instead
-# of anonymous cloud-server traffic, which YouTube's bot-detection often
-# blocks with a "Sign in to confirm you're not a bot" error.
-COOKIE_FILE = "/etc/secrets/cookies.txt"
  
  
 def _ensure_data_dir():
@@ -75,9 +81,6 @@ def _seed_archive(url, archive_path):
         "skip_download": True,
         "playlist_items": f"1-{SEED_COUNT}",
     }
-    if os.path.exists(COOKIE_FILE):
-        ydl_opts["cookiefile"] = COOKIE_FILE
- 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
  
@@ -101,7 +104,9 @@ def watch_add():
  
     if not url:
         return jsonify({"error": "Channel or playlist URL is required."}), 400
-    _ensure_data_dir()  
+ 
+    _ensure_data_dir()
+ 
     watch_id = uuid.uuid4().hex[:9]
     archive_path = os.path.join(DATA_DIR, f"archive_{watch_id}.txt")
     open(archive_path, "a").close()  # create empty archive file
@@ -122,6 +127,7 @@ def watch_add():
         "totalDownloaded": 0,
         "lastError": None,
         "seededExisting": seeded,
+        "blockedVideos": [],  # [{"id":..., "url":..., "title":...}] -- retried on every check
     }
  
     with watch_lock:
@@ -153,56 +159,115 @@ def watch_delete(watch_id):
 RECENT_WINDOW = 5  # only ever look at the latest N uploads per check
  
  
-import subprocess
- 
-RCLONE_REMOTE = "gdrive:YT-AutoDownloads"  # matches the folder created earlier
- 
- 
-def _sync_to_drive(local_folder, dest_subfolder):
-    """Moves newly downloaded files from local disk to Google Drive.
-    Uses 'rclone move' (not 'copy') so files are removed locally once
-    uploaded -- this matters because hosting platforms like Render use
-    ephemeral disks that can be wiped on restart/redeploy."""
-    dest = f"{RCLONE_REMOTE}/{dest_subfolder}"
-    try:
-        result = subprocess.run(
-            ["./rclone", "move", local_folder, dest, "--delete-empty-src-dirs"],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        if result.returncode != 0:
-            return f"rclone error: {result.stderr.strip()[:300]}"
-        return None
-    except FileNotFoundError:
-        return "rclone not found on PATH -- files stayed local, not uploaded."
-    except subprocess.TimeoutExpired:
-        return "rclone upload timed out after 10 minutes."
+def _get_archive_ids(archive_path):
+    """Reads a yt-dlp download_archive file and returns the set of video IDs
+    it already contains, e.g. lines like 'youtube VIDEOID' -> {'VIDEOID', ...}."""
+    ids = set()
+    if os.path.exists(archive_path):
+        with open(archive_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    ids.add(parts[1])
+    return ids
  
  
-def _check_one(entry):
-    """Runs yt-dlp against one watched URL, using its own archive file.
-    Only the latest RECENT_WINDOW uploads are even considered each run --
-    this avoids backfilling a channel's entire history (some have 900+
-    videos) and matches the "watch for upcoming videos" use case: we only
-    care about what's new since last check, not the full back-catalog.
-    Anything already in the archive is skipped automatically by yt-dlp."""
-    _, fmt_string = QUALITY_MAP.get(entry["quality"], QUALITY_MAP["4"])
-    folder = os.path.join(DOWNLOAD_ROOT, f"watched_{entry['id']}")
-    os.makedirs(folder, exist_ok=True)
- 
-    new_titles = []
-    seen_ids = set()
- 
+def _make_hook(new_titles, seen_ids):
+    """Shared progress hook: records a video as successfully downloaded the
+    first time yt-dlp reports it 'finished' (video+audio streams both fire
+    this event, so we dedupe by id)."""
     def hook(d):
         if d["status"] == "finished":
             info = d.get("info_dict") or {}
             vid = info.get("id")
             if vid and vid in seen_ids:
-                return  # video+audio streams both fire 'finished' -- count once
+                return
             if vid:
                 seen_ids.add(vid)
             new_titles.append(info.get("title") or "Untitled video")
+    return hook
+ 
+ 
+def _retry_blocked_videos(entry, folder, fmt_string):
+    """Attempts to (re)download every video previously blocked. Anything
+    that succeeds this time is removed from the blocked list and counted
+    as a new download -- fully automatic, no manual re-triggering needed.
+    Running from your home internet connection makes these retries far
+    more likely to succeed than they would from a cloud server."""
+    still_blocked = []
+    recovered_titles = []
+ 
+    for blocked in entry.get("blockedVideos", []):
+        seen_ids = set()
+        new_titles = []
+        ydl_opts = {
+            "format": fmt_string,
+            "merge_output_format": "mp4",
+            "outtmpl": os.path.join(folder, "%(upload_date)s - %(title)s.%(ext)s"),
+            "download_archive": entry["archivePath"],
+            "quiet": True,
+            "noprogress": True,
+            "ignoreerrors": True,
+            "socket_timeout": 30,
+            "progress_hooks": [_make_hook(new_titles, seen_ids)],
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([blocked["url"]])
+        except Exception:
+            pass  # still blocked -- keep it in the retry list below
+ 
+        if new_titles:
+            recovered_titles.extend(new_titles)
+        else:
+            still_blocked.append(blocked)
+ 
+    entry["blockedVideos"] = still_blocked
+    return recovered_titles
+ 
+ 
+def _check_one(entry):
+    """Runs yt-dlp against one watched URL, using its own archive file.
+    Only the latest RECENT_WINDOW uploads are even considered each run --
+    this avoids backfilling a channel's entire history and matches the
+    "watch for upcoming videos" use case: we only care about what's new
+    since last check, not the full back-catalog. Anything already in the
+    archive is skipped automatically by yt-dlp.
+ 
+    Videos are downloaded straight to DOWNLOAD_ROOT on your own disk --
+    no cloud upload step. Anything that fails gets recorded in
+    entry["blockedVideos"] and is automatically retried on the next check."""
+    _, fmt_string = QUALITY_MAP.get(entry["quality"], QUALITY_MAP["4"])
+    folder = os.path.join(DOWNLOAD_ROOT, f"watched_{entry['id']}")
+    os.makedirs(folder, exist_ok=True)
+ 
+    entry.setdefault("blockedVideos", [])
+ 
+    # Step 1: retry anything that was blocked on a previous check.
+    recovered_titles = _retry_blocked_videos(entry, folder, fmt_string)
+ 
+    # Step 2: find out which videos currently exist on the channel (latest
+    # RECENT_WINDOW), so we can tell which ones failed this run.
+    try:
+        list_opts = {
+            "quiet": True,
+            "extract_flat": True,
+            "skip_download": True,
+            "playlist_items": f"1-{RECENT_WINDOW}",
+        }
+        with yt_dlp.YoutubeDL(list_opts) as ydl:
+            info = ydl.extract_info(entry["url"], download=False)
+        candidates = info.get("entries") if info.get("entries") is not None else [info]
+        candidates = [c for c in candidates if c and c.get("id")]
+    except Exception:
+        candidates = []  # if this fails, just skip blocked-video bookkeeping this round
+ 
+    archive_ids_before = _get_archive_ids(entry["archivePath"])
+    already_blocked_ids = {b["id"] for b in entry["blockedVideos"]}
+ 
+    # Step 3: attempt the real download pass for the channel's recent uploads.
+    new_titles = list(recovered_titles)
+    seen_ids = set()
  
     ydl_opts = {
         "format": fmt_string,
@@ -214,29 +279,39 @@ def _check_one(entry):
         "noprogress": False,
         "ignoreerrors": True,
         "socket_timeout": 30,
-        "progress_hooks": [hook],
+        "progress_hooks": [_make_hook(new_titles, seen_ids)],
     }
-    if os.path.exists(COOKIE_FILE):
-        ydl_opts["cookiefile"] = COOKIE_FILE
  
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([entry["url"]])
  
-    sync_error = None
-    if new_titles:  # only bother syncing if something new actually downloaded
-        sync_error = _sync_to_drive(folder, entry["id"])
+    # Step 4: anything that neither was already archived, already known-
+    # blocked, nor succeeded just now is newly blocked -- queue it for
+    # automatic retry next time the app is opened.
+    for c in candidates:
+        vid = c["id"]
+        if vid in archive_ids_before or vid in already_blocked_ids or vid in seen_ids:
+            continue
+        vid_url = c.get("url") or c.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+        entry["blockedVideos"].append(
+            {"id": vid, "url": vid_url, "title": c.get("title") or "Untitled video"}
+        )
  
     entry["lastCheckedAt"] = time.time()
     entry["lastNewVideos"] = new_titles
     entry["totalDownloaded"] = entry.get("totalDownloaded", 0) + len(new_titles)
-    entry["lastError"] = sync_error  # None if sync succeeded (or nothing new to sync)
+    entry["lastError"] = None
+    entry["downloadFolder"] = folder  # so the UI can show/open where files landed
     return entry
  
  
 @watch_bp.route("/api/watch/tick", methods=["POST"])
 def watch_tick():
     """Trigger one check-and-download pass across every watched entry.
-    Call this from an external scheduler (cron-job.org, cron, Task Scheduler)."""
+    Called automatically once when app.py starts up (see bottom of app.py),
+    so simply opening the app is what triggers a check -- no external
+    scheduler needed. Can also be called manually via this endpoint
+    (e.g. a "Check now" button in the UI)."""
     with watch_lock:
         watches = _load_watches()
  
@@ -256,6 +331,7 @@ def watch_tick():
     summary = {
         "checked": len(results),
         "newVideosFound": sum(len(r["lastNewVideos"]) for r in results),
+        "stillBlocked": sum(len(r.get("blockedVideos", [])) for r in results),
         "results": results,
     }
     return jsonify(summary)
